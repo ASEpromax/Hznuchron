@@ -208,7 +208,7 @@ class HznuJwxt {
       }
       return Tuple(
         exceptionFrom(error, context: '杭师大课表', requestUri: uri, stackTrace: stackTrace),
-        const [],
+        const <Session>[],
       );
     }
   }
@@ -261,7 +261,7 @@ class HznuJwxt {
       }
       return Tuple(
         exceptionFrom(error, context: '杭师大成绩', requestUri: uri, stackTrace: stackTrace),
-        const [],
+        const <Grade>[],
       );
     }
   }
@@ -344,7 +344,7 @@ class HznuJwxt {
     } on Object catch (error, stackTrace) {
       return Tuple(
         exceptionFrom(error, context: '杭师大考试', requestUri: uri, stackTrace: stackTrace),
-        const [],
+        const <ExamDto>[],
       );
     }
   }
