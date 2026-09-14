@@ -59,18 +59,26 @@ class HznuJwxt {
     _jSessionId = null;
     _route = null;
 
-    final ssoLoginUrl = Uri.parse(
-        "$jwxtBaseUrl/jwglxt/xtgl/login_sso.html");
+    final Uri ssoLoginUrl;
+    if (ssoCookie.name == 'hznu_ticket') {
+      final loc = ssoCookie.value;
+      ssoLoginUrl =
+          Uri.parse(loc.startsWith('http') ? loc : '$jwxtBaseUrl$loc');
+    } else {
+      ssoLoginUrl = Uri.parse("$jwxtBaseUrl/jwglxt/xtgl/login_sso.html");
+    }
 
     final request = await httpClient.getUrl(ssoLoginUrl).timeout(
-          const Duration(seconds: 8),
+          const Duration(seconds: 10),
           onTimeout: () => throw requestTimeout('杭师大教务 SSO 登录超时'),
         );
     request.followRedirects = false;
-    request.cookies.add(ssoCookie);
+    if (ssoCookie.name != 'hznu_ticket') {
+      request.cookies.add(ssoCookie);
+    }
 
     final response = await request.close().timeout(
-          const Duration(seconds: 8),
+          const Duration(seconds: 10),
           onTimeout: () => throw requestTimeout('杭师大教务 SSO 响应超时'),
         );
 
@@ -82,14 +90,14 @@ class HznuJwxt {
       }
     }
 
-    // 如果返回 302 重定向
+    // 处理 302 重定向
     if (response.isRedirect) {
       var location = response.headers.value(HttpHeaders.locationHeader);
       if (location != null) {
         final redirectUri = Uri.parse(
             location.startsWith('http') ? location : '$jwxtBaseUrl$location');
         final redReq = await httpClient.getUrl(redirectUri).timeout(
-              const Duration(seconds: 8),
+              const Duration(seconds: 10),
               onTimeout: () => throw requestTimeout(),
             );
         redReq.followRedirects = false;
@@ -97,7 +105,7 @@ class HznuJwxt {
         if (_route != null) redReq.cookies.add(_route!);
 
         final redResp = await redReq.close().timeout(
-              const Duration(seconds: 8),
+              const Duration(seconds: 10),
               onTimeout: () => throw requestTimeout(),
             );
 

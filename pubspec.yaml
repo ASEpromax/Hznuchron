@@ -1,7 +1,7 @@
 name: celechron
 description: Hznuchron —— 杭州师范大学学生时间与日程管理工具：四种时间语义、子待办行程表、专注计时与统计、AI 整理。
 publish_to: "none"
-version: 1.4.1-elychron.1+6
+version: 1.4.2-hznu.1+7
 environment:
   sdk: ">=3.0.0"
 
@@ -33,6 +33,7 @@ dependencies:
   qr_flutter:
   app_links:
   crypto: 
+  encrypt: ^5.0.3
   path_provider:
   share_plus: ^12.0.1 # 9fb0fb 提交当中提升了版本
   device_calendar:
