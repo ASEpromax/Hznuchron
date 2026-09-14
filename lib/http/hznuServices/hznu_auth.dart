@@ -203,7 +203,8 @@ class HznuAuth {
 
   /// 执行认证握手
   static Future<Cookie?> _doLogin(
-      HttpClient httpClient, String username, String password) async {
+      HttpClient httpClient, String rawUsername, String password) async {
+    final username = rawUsername.trim();
     // 1. 网络探活
     final network = await checkNetworkAvailability(httpClient);
     if (!network.reachable) {
