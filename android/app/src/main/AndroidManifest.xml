@@ -1,0 +1,89 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="xyz.nosig.celechron">
+    <!-- 日历读写权限 -->
+   <uses-permission android:name="android.permission.READ_CALENDAR" />
+   <uses-permission android:name="android.permission.WRITE_CALENDAR" />
+    <!-- 任务提醒通知 -->
+   <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+   <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+   <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+   <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <!-- 闹钟模式：震动 + 全屏提醒 -->
+   <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+   <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- 手动把某条待办交给系统时钟（AlertClock.ACTION_SET_ALARM）：
+         这是 normal 权限，安装即授予，不需要运行时申请 -->
+   <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+
+    <!-- 专注时自动免打扰：「勿扰访问权限」属于特殊权限，声明只是前提，
+         用户还需要去系统设置里手动授予（设置页会引导跳转） -->
+   <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+
+    <!-- Android 11+ 的包可见性：不声明这段，resolveActivity(SET_ALARM) 一律返回 null，
+         于是「没有可用的系统时钟」——真机上就是这么翻车的。声明后才能看见时钟应用。 -->
+   <queries>
+       <intent>
+           <action android:name="android.intent.action.SET_ALARM" />
+       </intent>
+   </queries>
+   <application android:label="师大时间" android:name="${applicationName}" android:icon="@mipmap/ic_launcher">
+        <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTop" android:showWhenLocked="true" android:turnScreenOn="true" android:theme="@style/LaunchTheme" android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode" android:hardwareAccelerated="true" android:windowSoftInputMode="adjustResize">
+            <!-- Specifies an Android theme to apply to this Activity as soon as
+                 the Android process has started. This theme is visible to the user
+                 while the Flutter UI initializes. After that, this theme continues
+                 to determine the Window background behind the Flutter UI. -->
+            <meta-data android:name="io.flutter.embedding.android.NormalTheme" android:resource="@style/NormalTheme"/>
+            <meta-data android:name="flutter_deeplinking_enabled" android:value="false" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category" />
+                <data android:scheme="celechron"/>
+            </intent-filter>
+            <!-- 其它应用分享图片/文件/文本过来，直接在 Elychron 里新建待办 -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+
+        </activity>
+
+       <receiver android:name=".ECardWidgetReceiver"
+                 android:label="校园卡"
+                 android:exported="true">
+           <intent-filter>
+               <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+           </intent-filter>
+           <meta-data
+                   android:name="android.appwidget.provider"
+                   android:resource="@xml/ecard_widget_info" />
+       </receiver>
+
+        <!-- 任务提醒：定时通知的接收器（flutter_local_notifications） -->
+        <receiver android:exported="false"
+                  android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />
+        <receiver android:exported="false"
+                  android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON"/>
+            </intent-filter>
+        </receiver>
+
+        <!-- Don't delete the meta-data below.
+             This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
+        <meta-data android:name="flutterEmbedding" android:value="2"/>
+    </application>
+</manifest>

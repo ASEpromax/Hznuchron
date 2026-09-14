@@ -1,0 +1,871 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'package:celechron/utils/tuple.dart';
+import 'package:flutter/foundation.dart';
+
+import 'package:celechron/database/database_helper.dart';
+import 'package:celechron/utils/gpa_helper.dart';
+import 'package:celechron/model/grade.dart';
+import 'package:celechron/model/session.dart';
+import 'package:celechron/model/exams_dto.dart';
+import 'package:celechron/design/captcha_input.dart';
+import 'package:celechron/utils/global.dart';
+import 'package:celechron/services/diagnostic_log_service.dart';
+import 'exceptions.dart';
+import 'response_utils.dart';
+
+/// 本科教务网客户端；统一管理 CAS 业务会话、并发限流与按接口缓存降级。
+class Zdbk {
+  Cookie? _jSessionId;
+  Cookie? _route;
+  Cookie? _iPlanetDirectoryPro;
+  String? _captcha;
+  DatabaseHelper? _db;
+  Future<bool>? _loginFuture;
+  int _sessionGeneration = 0;
+  int _activeSiteRequests = 0;
+  final List<Completer<void>> _siteWaiters = [];
+
+  set db(DatabaseHelper? db) {
+    _db = db;
+  }
+
+  DateTime? get practiceScoresCacheUpdatedAt {
+    final value = _db?.getCachedWebPage('zdbk_practiceScores_timestamp');
+    return value == null ? null : DateTime.tryParse(value)?.toLocal();
+  }
+
+  Future<bool> login(HttpClient httpClient, Cookie? iPlanetDirectoryPro) async {
+    if (iPlanetDirectoryPro == null) {
+      throw AuthenticationExpiredException("教务网：统一身份认证凭据无效");
+    }
+    _iPlanetDirectoryPro = iPlanetDirectoryPro;
+    // 同一客户端只建立一套 JSESSIONID/route，避免并发 CAS 回调互相覆盖。
+    final pending = _loginFuture;
+    if (pending != null) return await pending;
+    final login = _doLogin(httpClient, iPlanetDirectoryPro);
+    _loginFuture = login;
+    try {
+      return await login;
+    } finally {
+      if (identical(_loginFuture, login)) _loginFuture = null;
+    }
+  }
+
+  Future<bool> _doLogin(
+      HttpClient httpClient, Cookie iPlanetDirectoryPro) async {
+    late HttpClientRequest request;
+    late HttpClientResponse response;
+
+    _captcha = null;
+    _jSessionId = null;
+    _route = null;
+    // 第一步用统一认证 Cookie 换取 service 跳转；第二步访问跳转地址，
+    // 业务站才会签发必须成对使用的 JSESSIONID 与 route。
+    request = await httpClient
+        .getUrl(Uri.parse(
+            "https://zjuam.zju.edu.cn/cas/login?service=https%3A%2F%2Fzdbk.zju.edu.cn%2Fjwglxt%2Fxtgl%2Flogin_ssologin.html"))
+        .timeout(const Duration(seconds: 8),
+            onTimeout: () => throw requestTimeout());
+    request.followRedirects = false;
+    request.cookies.add(iPlanetDirectoryPro);
+    response = await request.close().timeout(const Duration(seconds: 8),
+        onTimeout: () => throw requestTimeout());
+    final firstBody = await readResponseBody(response, context: '教务网 CAS 登录');
+
+    var stLocation = response.headers.value('location');
+    if (!response.isRedirect || stLocation == null) {
+      throw AuthenticationExpiredException(
+          "教务网登录：统一身份认证凭据无效；HTTP ${response.statusCode}"
+          "；Location ${stLocation ?? '<缺失>'}"
+          "；响应摘要：${responseSummary(firstBody)}");
+    } else if (stLocation.startsWith("http://")) {
+      stLocation = stLocation.replaceFirst("http://", "https://");
+    }
+    request = await httpClient.getUrl(Uri.parse(stLocation)).timeout(
+        const Duration(seconds: 8),
+        onTimeout: () => throw requestTimeout());
+    request.followRedirects = false;
+    response = await request.close().timeout(const Duration(seconds: 8),
+        onTimeout: () => throw requestTimeout());
+    final secondBody = await readResponseBody(response, context: '教务网登录');
+    if (response.statusCode == HttpStatus.unauthorized ||
+        response.statusCode == HttpStatus.forbidden ||
+        bodyIndicatesAuthenticationFailure(secondBody)) {
+      throw AuthenticationExpiredException(
+          "教务网登录态失效；HTTP ${response.statusCode}"
+          "；Location ${response.headers.value(HttpHeaders.locationHeader) ?? '<缺失>'}"
+          "；响应摘要：${responseSummary(secondBody)}");
+    }
+    if (response.statusCode < 200 || response.statusCode >= 400) {
+      throw ExceptionWithMessage("教务网登录失败；HTTP ${response.statusCode}"
+          "；Content-Type ${response.headers.value(HttpHeaders.contentTypeHeader) ?? '<缺失>'}"
+          "；响应摘要：${responseSummary(secondBody)}");
+    }
+
+    if (response.cookies.any((element) => element.name == 'JSESSIONID')) {
+      _jSessionId = response.cookies
+          .firstWhere((element) => element.name == 'JSESSIONID');
+    } else {
+      throw ExceptionWithMessage(
+          "教务网登录无法获取 JSESSIONID；HTTP ${response.statusCode}"
+          "；响应摘要：${responseSummary(secondBody)}");
+    }
+
+    if (response.cookies.any((element) => element.name == 'route')) {
+      _route =
+          response.cookies.firstWhere((element) => element.name == 'route');
+    } else {
+      throw ExceptionWithMessage("教务网登录无法获取 route；HTTP ${response.statusCode}"
+          "；响应摘要：${responseSummary(secondBody)}");
+    }
+
+    _sessionGeneration++;
+    return true;
+  }
+
+  void logout() {
+    _jSessionId = null;
+    _route = null;
+    _iPlanetDirectoryPro = null;
+    _captcha = null;
+  }
+
+  void _validateResponse(HttpClientResponse response, String responseText,
+      {required String context,
+      required Uri requestUri,
+      bool expectJson = true,
+      bool relogged = false,
+      bool retried = false}) {
+    try {
+      validateResponse(
+        response: response,
+        body: responseText,
+        context: context,
+        expectJson: expectJson,
+        requestUri: requestUri,
+        relogged: relogged,
+        retried: retried,
+      );
+    } on AuthenticationExpiredException catch (error) {
+      throw SessionExpiredException(
+        shortErrorText(error),
+        details: detailedErrorText(error),
+        originalError: error,
+        stackTrace: error.stackTrace,
+      );
+    }
+  }
+
+  Future<void> _relogin(HttpClient httpClient) async {
+    final iPlanetDirectoryPro = _iPlanetDirectoryPro;
+    if (iPlanetDirectoryPro == null) {
+      throw LoginExpiredException("教务网会话已过期，请重新登录");
+    }
+    await login(httpClient, iPlanetDirectoryPro);
+  }
+
+  Future<T> _withAutoRelogin<T>(HttpClient httpClient,
+      Future<T> Function(bool relogged, bool retried) requestFactory) {
+    return _withSitePermit(
+      () => _withAutoReloginUnlocked(httpClient, requestFactory),
+    );
+  }
+
+  Future<T> _withAutoReloginUnlocked<T>(HttpClient httpClient,
+      Future<T> Function(bool relogged, bool retried) requestFactory) async {
+    var relogged = false;
+    for (var i = 0; i < 2; i++) {
+      var generation = _sessionGeneration;
+      var reloginAttempted = false;
+      try {
+        if (_jSessionId == null || _route == null) {
+          reloginAttempted = true;
+          await _relogin(httpClient);
+          relogged = true;
+          generation = _sessionGeneration;
+        }
+        return await requestFactory(relogged, i > 0);
+      } on AuthenticationExpiredException catch (error) {
+        if (i == 1 || reloginAttempted) {
+          throw LoginExpiredException(
+            "教务网会话已过期，请手动重新登录",
+            details: detailedErrorText(error),
+            originalError: error,
+          );
+        }
+        // 若其它并发请求已更新会话，本请求直接复用，避免重复登录。
+        if (_sessionGeneration == generation) {
+          await _relogin(httpClient);
+          relogged = true;
+        }
+      }
+    }
+    throw LoginExpiredException("教务网会话已过期，请手动重新登录");
+  }
+
+  Future<T> _withSitePermit<T>(Future<T> Function() action) async {
+    // 限制同时访问教务站的请求数，避免刷新时多个模块共同放大瞬时压力。
+    if (_activeSiteRequests >= 3) {
+      final waiter = Completer<void>();
+      _siteWaiters.add(waiter);
+      await waiter.future;
+    }
+    _activeSiteRequests++;
+    try {
+      return await action();
+    } finally {
+      _activeSiteRequests--;
+      if (_siteWaiters.isNotEmpty) {
+        _siteWaiters.removeAt(0).complete();
+      }
+    }
+  }
+
+  _CachedList _cachedList(String cacheKey, String context) {
+    // 缓存内容必须重新走与实时响应相同的解析器；损坏缓存视为不可用。
+    final cached = _db?.getCachedWebPage(cacheKey);
+    if (cached == null || cached.trim().isEmpty) {
+      return const _CachedList([], false);
+    }
+    try {
+      final cachedAt = _db?.getCachedWebPage('${cacheKey}_timestamp') ?? '<未知>';
+      DiagnosticLogService.instance.record(
+        level: CelechronLogLevel.warning,
+        module: context,
+        operation: 'readCache',
+        cacheUsed: true,
+        message: '使用缓存；缓存时间=$cachedAt',
+      );
+      return _CachedList(
+        decodeJsonList(cached, context: context),
+        true,
+        cachedAt: cachedAt,
+      );
+    } on Object catch (error, stackTrace) {
+      DiagnosticLogService.instance.record(
+        level: CelechronLogLevel.warning,
+        module: context,
+        operation: 'readCache',
+        cacheUsed: false,
+        error: error,
+        stackTrace: stackTrace,
+      );
+      return const _CachedList([], false);
+    }
+  }
+
+  void _writeCache(String cacheKey, String value) {
+    unawaited(Future.wait([
+      _db?.setCachedWebPage(cacheKey, value) ?? Future<void>.value(),
+      _db?.setCachedWebPage(
+            '${cacheKey}_timestamp',
+            DateTime.now().toUtc().toIso8601String(),
+          ) ??
+          Future<void>.value(),
+    ]));
+  }
+
+  Exception _cacheAwareException(
+    Exception exception,
+    _CachedList cache,
+    String context,
+  ) {
+    // 返回缓存时仍保留实时异常，并用降级标记告知上层不要清空旧数据。
+    if (!cache.used) return exception;
+    return CachedDataException(
+      '$context：实时请求失败，已使用缓存',
+      details: [
+        '缓存时间：${cache.cachedAt ?? '<未知>'}',
+        detailedErrorText(exception),
+      ].join('\n'),
+      originalError: exception,
+      stackTrace:
+          exception is ExceptionWithMessage ? exception.stackTrace : null,
+    );
+  }
+
+  List<Grade> _parseGrades(Object? raw, String context, {bool major = false}) {
+    final items = asDynamicList(raw) ?? const [];
+    final grades = <Grade>[];
+    for (var index = 0; index < items.length; index++) {
+      final item = asStringMap(items[index]);
+      if (item == null) {
+        if (kDebugMode) {
+          debugPrint('$context：跳过第 ${index + 1} 条成绩，条目不是对象');
+        }
+        continue;
+      }
+      try {
+        final grade = major ? Grade.fromMajor(item) : Grade(item);
+        grades.add(grade);
+      } on Object catch (error, stackTrace) {
+        if (kDebugMode) {
+          debugPrint(
+              '$context：跳过第 ${index + 1} 条成绩：${error.runtimeType}: $error\n$stackTrace');
+        }
+      }
+    }
+    return grades;
+  }
+
+  /// 本轮刷新里，教务课表接口一共返回了多少**行原始数据**（仅供诊断）。
+  ///
+  /// 和「解析出多少条」放一起看，才能分清两种完全不同的故障：
+  /// 学校压根没给数据（原始 0 行），还是 App 解析不了（原始很多行、解析 0 条）。
+  int timetableRawRowsForDiagnostics = 0;
+
+  /// [requestedSeason] 是本次查询的学期参数（`1|秋` 等），交给 [Session.fromZdbk]
+  /// 作为半学期的兜底来源。
+  List<Session> _parseSessions(Object? raw, String context,
+      {String? requestedSeason}) {
+    final items = asDynamicList(raw) ?? const [];
+    timetableRawRowsForDiagnostics += items.length;
+    final sessions = <Session>[];
+    for (var index = 0; index < items.length; index++) {
+      final item = asStringMap(items[index]);
+      if (item == null ||
+          item['kcb'] == null ||
+          asString(item['sfyjskc']) == '1') {
+        continue;
+      }
+      try {
+        sessions.add(
+            Session.fromZdbk(item, requestedSeason: requestedSeason));
+      } on Object catch (error, stackTrace) {
+        if (kDebugMode) {
+          debugPrint(
+              '$context：跳过第 ${index + 1} 条课程：${error.runtimeType}: $error\n$stackTrace');
+        }
+      }
+    }
+    // 只记条数，不记课程内容；出问题时一眼能看出是「没抓到」还是「抓到了被过滤掉」。
+    final confirmed = sessions.where((e) => e.confirmed).length;
+    final firstHalf = sessions.where((e) => e.firstHalf).length;
+    final secondHalf = sessions.where((e) => e.secondHalf).length;
+    DiagnosticLogService.instance.record(
+      module: '课表',
+      operation: 'parse',
+      message: '$context：原始 ${items.length} 条，解析出 ${sessions.length} 条；'
+          '已确定 $confirmed 条；上半学期 $firstHalf 条；下半学期 $secondHalf 条',
+    );
+    return sessions;
+  }
+
+  List<ExamDto> _parseExams(Object? raw, String context) {
+    final items = asDynamicList(raw) ?? const [];
+    final exams = <ExamDto>[];
+    for (var index = 0; index < items.length; index++) {
+      final item = asStringMap(items[index]);
+      if (item == null) continue;
+      try {
+        exams.add(ExamDto.fromZdbk(item));
+      } on Object catch (error, stackTrace) {
+        if (kDebugMode) {
+          debugPrint(
+              '$context：跳过第 ${index + 1} 条考试：${error.runtimeType}: $error\n$stackTrace');
+        }
+      }
+    }
+    return exams;
+  }
+
+  Future<Tuple<Exception?, Tuple<List<double>, String>>> getMajorGrade(
+      HttpClient httpClient) async {
+    return await _withAutoRelogin(httpClient, (relogged, retried) async {
+      late HttpClientRequest request;
+      late HttpClientResponse response;
+      final uri = Uri.parse(
+          "https://zdbk.zju.edu.cn/jwglxt/zycjtj/xszgkc_cxXsZgkcIndex.html?doType=query&queryModel.showCount=5000");
+
+      try {
+        request = await httpClient.postUrl(uri).timeout(
+            const Duration(seconds: 8),
+            onTimeout: () => throw requestTimeout());
+        request.headers
+          ..add("Referer",
+              "https://zdbk.zju.edu.cn/jwglxt/xtgl/index_initMenu.html")
+          ..set('Connection', 'close')
+          ..add('User-Agent',
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
+          ..add('Accept', 'application/json, text/javascript, */*; q=0.01')
+          ..add('X-Requested-With', 'XMLHttpRequest');
+        request.cookies.add(_jSessionId!);
+        request.cookies.add(_route!);
+        request.followRedirects = false;
+        response = await request.close().timeout(const Duration(seconds: 8),
+            onTimeout: () => throw requestTimeout());
+
+        var responseText =
+            await readResponseBody(response, context: '教务网主修成绩接口');
+        const context = '教务网主修成绩接口';
+        _validateResponse(response, responseText,
+            context: context,
+            requestUri: uri,
+            relogged: relogged,
+            retried: retried);
+        final payload = decodeJsonMap(responseText,
+            context: '$context；HTTP ${response.statusCode}');
+        final items = asDynamicList(payload['items']);
+        if (items == null) {
+          throw ExceptionWithMessage(
+              '$context：缺少 items 数组；HTTP ${response.statusCode}'
+              '；响应摘要：${responseSummary(responseText)}');
+        }
+        final grades = _parseGrades(items, context, major: true);
+        var majorGpa = GpaHelper.calculateGpa(grades);
+        _writeCache('zdbk_MajorGrade', jsonEncode(items));
+        return Tuple(
+            null, Tuple([majorGpa.item1[0], majorGpa.item2], responseText));
+      } on Object catch (error, stackTrace) {
+        if (error is AuthenticationExpiredException) rethrow;
+        final exception = exceptionFrom(error,
+            context: '教务网主修成绩接口',
+            requestUri: uri,
+            relogged: relogged,
+            retried: retried,
+            stackTrace: stackTrace);
+        final cachedItems = _cachedList('zdbk_MajorGrade', '教务网主修成绩缓存');
+        final grades = _parseGrades(cachedItems.data, '教务网主修成绩缓存', major: true);
+        var majorGpa = GpaHelper.calculateGpa(grades);
+        return Tuple(
+            _cacheAwareException(exception, cachedItems, '教务网主修成绩'),
+            Tuple([majorGpa.item1[0], majorGpa.item2],
+                '{"items":${jsonEncode(cachedItems.data)},"limit":0}'));
+      }
+    });
+  }
+
+  Future<Tuple<Exception?, Iterable<Grade>>> getTranscript(
+      HttpClient httpClient) async {
+    return await _withAutoRelogin(httpClient, (relogged, retried) async {
+      late HttpClientRequest request;
+      late HttpClientResponse response;
+      final uri = Uri.parse(
+          "https://zdbk.zju.edu.cn/jwglxt/cxdy/xscjcx_cxXscjIndex.html?doType=query&queryModel.showCount=5000");
+
+      try {
+        request = await httpClient.postUrl(uri).timeout(
+            const Duration(seconds: 8),
+            onTimeout: () => throw requestTimeout());
+        request.headers
+          ..add("Referer",
+              "https://zdbk.zju.edu.cn/jwglxt/xtgl/index_initMenu.html")
+          ..set('Connection', 'close')
+          ..add('User-Agent',
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
+          ..add('Accept', 'application/json, text/javascript, */*; q=0.01')
+          ..add('X-Requested-With', 'XMLHttpRequest');
+        request.cookies.add(_jSessionId!);
+        request.cookies.add(_route!);
+        request.followRedirects = false;
+        response = await request.close().timeout(const Duration(seconds: 8),
+            onTimeout: () => throw requestTimeout());
+
+        var responseText = await readResponseBody(response, context: '教务网成绩接口');
+        const context = '教务网成绩接口';
+        _validateResponse(response, responseText,
+            context: context,
+            requestUri: uri,
+            relogged: relogged,
+            retried: retried);
+        final payload = decodeJsonMap(responseText,
+            context: '$context；HTTP ${response.statusCode}');
+        final items = asDynamicList(payload['items']);
+        if (items == null) {
+          throw ExceptionWithMessage(
+              '$context：缺少 items 数组；HTTP ${response.statusCode}'
+              '；响应摘要：${responseSummary(responseText)}');
+        }
+        final grades = _parseGrades(items, context);
+        _writeCache('zdbk_Transcript', jsonEncode(items));
+        return Tuple(null, grades);
+      } on Object catch (error, stackTrace) {
+        if (error is AuthenticationExpiredException) rethrow;
+        final exception = exceptionFrom(error,
+            context: '教务网成绩接口',
+            requestUri: uri,
+            relogged: relogged,
+            retried: retried,
+            stackTrace: stackTrace);
+        final cached = _cachedList('zdbk_Transcript', '教务网成绩缓存');
+        return Tuple(
+          _cacheAwareException(exception, cached, '教务网成绩'),
+          _parseGrades(cached.data, '教务网成绩缓存'),
+        );
+      }
+    });
+  }
+
+  Future<Tuple<Exception?, Iterable<Session>>> getTimetable(
+      HttpClient httpClient, String year, String semester) async {
+    return await _withAutoRelogin(httpClient, (relogged, retried) async {
+      late HttpClientRequest request;
+      late HttpClientResponse response;
+      final uri =
+          Uri.parse("https://zdbk.zju.edu.cn/jwglxt/kbcx/xskbcx_cxXsKb.html");
+
+      try {
+        for (var i = 0; i < 3; i++) {
+          request = await httpClient.postUrl(uri).timeout(
+              const Duration(seconds: 8),
+              onTimeout: () => throw requestTimeout());
+          request.headers
+            ..add("Referer",
+                "https://zdbk.zju.edu.cn/jwglxt/xtgl/index_initMenu.html")
+            ..set('Connection', 'close')
+            ..add('User-Agent',
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
+            ..add('Accept', 'application/json, text/javascript, */*; q=0.01')
+            ..add('X-Requested-With', 'XMLHttpRequest');
+          request.cookies.add(_jSessionId!);
+          request.cookies.add(_route!);
+          request.followRedirects = false;
+          request.headers.contentType = ContentType(
+              'application', 'x-www-form-urlencoded',
+              charset: 'utf-8');
+          request.add(
+              utf8.encode('xnm=$year&xqm=$semester&captcha_value=$_captcha'));
+          response = await request.close().timeout(const Duration(seconds: 8),
+              onTimeout: () => throw requestTimeout());
+
+          var responseText =
+              await readResponseBody(response, context: '教务网课表接口');
+          final context = '教务网课表接口（学年 $year，学期 $semester，请求类型 课表）';
+          _validateResponse(response, responseText,
+              context: context,
+              requestUri: uri,
+              relogged: relogged,
+              retried: retried);
+
+          if (responseText.contains("captcha_error")) {
+            _captcha = null;
+            if (GlobalStatus.isFirstScreenReq) {
+              throw ExceptionWithMessage("需要验证码");
+            }
+            var imageBytes = await getCaptcha(httpClient);
+            var captcha = await ImageCodePortal.show(
+                imageBytes: imageBytes,
+                onRefresh: () async {
+                  return await getCaptcha(httpClient);
+                });
+            if (captcha == null) {
+              throw ExceptionWithMessage("验证码未填写");
+            }
+            _captcha = captcha.trim();
+            continue;
+          }
+
+          if (responseText.trim() == "null") return Tuple(null, <Session>[]);
+          final payload = decodeJsonMap(responseText,
+              context: '$context；HTTP ${response.statusCode}');
+          final items = asDynamicList(payload['kbList']);
+          if (items == null) {
+            throw ExceptionWithMessage(
+                '$context：缺少 kbList 数组；HTTP ${response.statusCode}'
+                '；响应摘要：${responseSummary(responseText)}');
+          }
+          final sessions =
+              _parseSessions(items, context, requestedSeason: semester);
+          // 只缓存**非空**响应：这份原始报文是请求失败时唯一的兜底来源，
+          // 拿一次「成功但 0 行」把它覆盖掉，就等于把上一次好数据也弄没了。
+          if (items.isNotEmpty) {
+            _writeCache('zdbk_Timetable$year$semester', jsonEncode(items));
+          } else {
+            DiagnosticLogService.instance.record(
+              level: CelechronLogLevel.warning,
+              module: '课表',
+              operation: 'emptyResponse',
+              cacheUsed: true,
+              message: '$context：返回 0 行，保留上一次的非空缓存作为兜底',
+            );
+          }
+          return Tuple(null, sessions);
+        }
+        throw ExceptionWithMessage("验证码识别失败");
+      } on Object catch (error, stackTrace) {
+        if (error is AuthenticationExpiredException) rethrow;
+        final context = '教务网课表接口（学年 $year，学期 $semester，请求类型 课表）';
+        final exception = exceptionFrom(error,
+            context: context,
+            requestUri: uri,
+            relogged: relogged,
+            retried: retried,
+            stackTrace: stackTrace);
+        final cached =
+            _cachedList('zdbk_Timetable$year$semester', '$context 缓存');
+        return Tuple(
+          _cacheAwareException(exception, cached, context),
+          _parseSessions(cached.data, '$context 缓存',
+              requestedSeason: semester),
+        );
+      }
+    });
+  }
+
+  Future<Tuple<Exception?, Iterable<ExamDto>>> getExamsDto(
+      HttpClient httpClient) async {
+    return await _withAutoRelogin(httpClient, (relogged, retried) async {
+      late HttpClientRequest request;
+      late HttpClientResponse response;
+      final uri = Uri.parse(
+          "https://zdbk.zju.edu.cn/jwglxt/xskscx/kscx_cxXsgrksIndex.html?doType=query&queryModel.showCount=5000");
+
+      try {
+        request = await httpClient.postUrl(uri).timeout(
+            const Duration(seconds: 8),
+            onTimeout: () => throw requestTimeout());
+        request.headers
+          ..add("Referer",
+              "https://zdbk.zju.edu.cn/jwglxt/xtgl/index_initMenu.html")
+          ..set('Connection', 'close')
+          ..add('User-Agent',
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
+          ..add('Accept', 'application/json, text/javascript, */*; q=0.01')
+          ..add('X-Requested-With', 'XMLHttpRequest');
+        request.cookies.add(_jSessionId!);
+        request.cookies.add(_route!);
+        request.followRedirects = false;
+        response = await request.close().timeout(const Duration(seconds: 8),
+            onTimeout: () => throw requestTimeout());
+
+        var responseText = await readResponseBody(response, context: '教务网考试接口');
+        const context = '教务网考试接口（请求类型 考试）';
+        _validateResponse(response, responseText,
+            context: context,
+            requestUri: uri,
+            relogged: relogged,
+            retried: retried);
+        final payload = decodeJsonMap(responseText,
+            context: '$context；HTTP ${response.statusCode}');
+        final items = asDynamicList(payload['items']);
+        if (items == null) {
+          throw ExceptionWithMessage(
+              '$context：缺少 items 数组；HTTP ${response.statusCode}'
+              '；响应摘要：${responseSummary(responseText)}');
+        }
+        final exams = _parseExams(items, context);
+        _writeCache('zdbk_exams', jsonEncode(items));
+        return Tuple(null, exams);
+      } on Object catch (error, stackTrace) {
+        if (error is AuthenticationExpiredException) rethrow;
+        final exception = exceptionFrom(error,
+            context: '教务网考试接口（请求类型 考试）',
+            requestUri: uri,
+            relogged: relogged,
+            retried: retried,
+            stackTrace: stackTrace);
+        final cached = _cachedList('zdbk_exams', '教务网考试缓存');
+        return Tuple(
+          _cacheAwareException(exception, cached, '教务网考试'),
+          _parseExams(cached.data, '教务网考试缓存'),
+        );
+      }
+    });
+  }
+
+  Future<Tuple<Exception?, Map<String, double>>> getPracticeScores(
+      HttpClient httpClient, String studentId) async {
+    return await _withAutoRelogin(httpClient, (relogged, retried) async {
+      late HttpClientRequest request;
+      late HttpClientResponse response;
+      final uri = Uri.parse(
+          "https://zdbk.zju.edu.cn/jwglxt/dessktgl/dessktcx_cxDessktcxIndex.html?gnmkdm=N108001&layout=default&su=$studentId");
+
+      try {
+        request = await httpClient.getUrl(uri).timeout(
+            const Duration(seconds: 8),
+            onTimeout: () => throw requestTimeout());
+        request.headers
+          ..add("Referer",
+              "https://zdbk.zju.edu.cn/jwglxt/xtgl/index_initMenu.html")
+          ..set('Connection', 'close')
+          ..add('User-Agent',
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
+          ..add('Accept',
+              'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8');
+        request.cookies.add(_jSessionId!);
+        request.cookies.add(_route!);
+        request.followRedirects = false;
+        response = await request.close().timeout(const Duration(seconds: 8),
+            onTimeout: () => throw requestTimeout());
+
+        var html = await readResponseBody(response, context: '教务网实践分接口');
+        _validateResponse(response, html,
+            context: '教务网实践分接口（学号 $studentId，请求类型 实践分）',
+            requestUri: uri,
+            expectJson: false,
+            relogged: relogged,
+            retried: retried);
+
+        _writeCache("zdbk_practiceScores", html);
+
+        var scores = <String, double>{
+          'pt2': 0.0,
+          'pt3': 0.0,
+          'pt4': 0.0,
+        };
+
+        var rowPattern = RegExp(
+            r'<tr>.*?<td[^>]*>.*?</td>.*?<td[^>]*>(.*?)</td>.*?<td[^>]*>(.*?)</td>.*?</tr>',
+            dotAll: true);
+        var matches = rowPattern.allMatches(html);
+
+        for (var match in matches) {
+          var type = match.group(1)?.trim();
+          var scoreStr = match.group(2)?.trim();
+          if (type == null || scoreStr == null) continue;
+
+          final score = double.tryParse(scoreStr);
+          if (score == null) continue;
+
+          if (type.contains('第二课堂')) {
+            scores['pt2'] = score;
+          } else if (type.contains('第三课堂')) {
+            scores['pt3'] = score;
+          } else if (type.contains('第四课堂')) {
+            scores['pt4'] = score;
+          }
+        }
+
+        if (scores['pt2'] == 0.0 &&
+            scores['pt3'] == 0.0 &&
+            scores['pt4'] == 0.0) {
+          var altPattern = RegExp(
+              r'<td[^>]*>第二课堂</td>.*?<td[^>]*>([0-9.]+)</td>',
+              dotAll: true);
+          var pt2Match = altPattern.firstMatch(html);
+          if (pt2Match != null) {
+            scores['pt2'] = double.tryParse(pt2Match.group(1) ?? '0') ?? 0.0;
+          }
+
+          altPattern = RegExp(r'<td[^>]*>第三课堂</td>.*?<td[^>]*>([0-9.]+)</td>',
+              dotAll: true);
+          var pt3Match = altPattern.firstMatch(html);
+          if (pt3Match != null) {
+            scores['pt3'] = double.tryParse(pt3Match.group(1) ?? '0') ?? 0.0;
+          }
+
+          altPattern = RegExp(r'<td[^>]*>第四课堂</td>.*?<td[^>]*>([0-9.]+)</td>',
+              dotAll: true);
+          var pt4Match = altPattern.firstMatch(html);
+          if (pt4Match != null) {
+            scores['pt4'] = double.tryParse(pt4Match.group(1) ?? '0') ?? 0.0;
+          }
+        }
+
+        return Tuple(null, scores);
+      } on Object catch (error, stackTrace) {
+        if (error is AuthenticationExpiredException) rethrow;
+
+        final exception = exceptionFrom(error,
+            context: '教务网实践分接口（学号 $studentId，请求类型 实践分）',
+            requestUri: uri,
+            relogged: relogged,
+            retried: retried,
+            stackTrace: stackTrace);
+
+        var cachedHtml = _db?.getCachedWebPage("zdbk_practiceScores");
+        if (cachedHtml != null) {
+          try {
+            var scores = <String, double>{
+              'pt2': 0.0,
+              'pt3': 0.0,
+              'pt4': 0.0,
+            };
+            var altPattern = RegExp(
+                r'<td[^>]*>第二课堂</td>.*?<td[^>]*>([0-9.]+)</td>',
+                dotAll: true);
+            var pt2Match = altPattern.firstMatch(cachedHtml);
+            if (pt2Match != null) {
+              scores['pt2'] = double.tryParse(pt2Match.group(1) ?? '0') ?? 0.0;
+            }
+
+            altPattern = RegExp(r'<td[^>]*>第三课堂</td>.*?<td[^>]*>([0-9.]+)</td>',
+                dotAll: true);
+            var pt3Match = altPattern.firstMatch(cachedHtml);
+            if (pt3Match != null) {
+              scores['pt3'] = double.tryParse(pt3Match.group(1) ?? '0') ?? 0.0;
+            }
+
+            altPattern = RegExp(r'<td[^>]*>第四课堂</td>.*?<td[^>]*>([0-9.]+)</td>',
+                dotAll: true);
+            var pt4Match = altPattern.firstMatch(cachedHtml);
+            if (pt4Match != null) {
+              scores['pt4'] = double.tryParse(pt4Match.group(1) ?? '0') ?? 0.0;
+            }
+            final cachedException = CachedDataException(
+              '教务网实践分：实时请求失败，已使用缓存',
+              details: detailedErrorText(exception),
+              originalError: exception,
+            );
+            return Tuple(cachedException, scores);
+          } on Object catch (cacheError, cacheStackTrace) {
+            DiagnosticLogService.instance.record(
+              level: CelechronLogLevel.warning,
+              module: '教务网实践分',
+              operation: 'readCache',
+              cacheUsed: false,
+              error: cacheError,
+              stackTrace: cacheStackTrace,
+            );
+          }
+        }
+        return Tuple(exception, {'pt2': 0.0, 'pt3': 0.0, 'pt4': 0.0});
+      }
+    });
+  }
+
+  Future<Uint8List> getCaptcha(HttpClient httpClient) async {
+    late HttpClientRequest request;
+    late HttpClientResponse response;
+
+    if (_jSessionId == null || _route == null) {
+      throw ExceptionWithMessage("未登录");
+    }
+    request = await httpClient
+        .getUrl(Uri.parse(
+            "https://zdbk.zju.edu.cn/jwglxt/kaptcha?time=${DateTime.now().millisecondsSinceEpoch}"))
+        .timeout(const Duration(seconds: 8),
+            onTimeout: () => throw requestTimeout());
+    request.cookies.add(_jSessionId!);
+    request.cookies.add(_route!);
+    request.followRedirects = false;
+    response = await request.close().timeout(const Duration(seconds: 8),
+        onTimeout: () => throw requestTimeout());
+    var bytes = await consolidateHttpClientResponseBytes(response);
+    final contentType =
+        response.headers.value(HttpHeaders.contentTypeHeader) ?? '<缺失>';
+    final location = response.headers.value(HttpHeaders.locationHeader);
+    if (response.isRedirect ||
+        response.statusCode == HttpStatus.unauthorized ||
+        response.statusCode == HttpStatus.forbidden) {
+      throw AuthenticationExpiredException(
+          '教务网验证码接口：登录态已失效；HTTP ${response.statusCode}'
+          '${location == null ? '' : '；Location $location'}');
+    }
+    if (response.statusCode < 200 ||
+        response.statusCode >= 300 ||
+        !contentType.toLowerCase().startsWith('image/')) {
+      final body = utf8.decode(bytes, allowMalformed: true);
+      throw ExceptionWithMessage('教务网验证码接口返回异常；HTTP ${response.statusCode}'
+          '；Content-Type $contentType'
+          '${location == null ? '' : '；Location $location'}'
+          '；响应摘要：${responseSummary(body)}');
+    }
+    return bytes;
+  }
+
+  Future<String> solveCaptcha(HttpClient httpClient) async {
+    throw UnimplementedError("验证码识别功能未开发");
+  }
+}
+
+class _CachedList {
+  final List<dynamic> data;
+  final bool used;
+  final String? cachedAt;
+
+  const _CachedList(this.data, this.used, {this.cachedAt});
+}
