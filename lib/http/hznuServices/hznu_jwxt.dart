@@ -234,7 +234,7 @@ class HznuJwxt {
       final grades = <Grade>[];
       for (final item in items) {
         if (item is Map<String, dynamic>) {
-          grades.add(Grade.fromZdbk(item));
+          grades.add(Grade(item));
         }
       }
 
@@ -250,7 +250,7 @@ class HznuJwxt {
           final items = jsonMap['items'] as List<dynamic>? ?? [];
           final cachedGrades = items
               .whereType<Map<String, dynamic>>()
-              .map((e) => Grade.fromZdbk(e))
+              .map((e) => Grade(e))
               .toList();
           return Tuple(
             CachedDataException('杭师大成绩获取失败，已使用本地缓存',
@@ -287,7 +287,7 @@ class HznuJwxt {
       final grades = <Grade>[];
       for (final item in items) {
         if (item is Map<String, dynamic>) {
-          grades.add(Grade.fromZdbk(item, major: true));
+          grades.add(Grade.fromMajor(item));
         }
       }
 
@@ -302,7 +302,7 @@ class HznuJwxt {
           final items = jsonMap['items'] as List<dynamic>? ?? [];
           final grades = items
               .whereType<Map<String, dynamic>>()
-              .map((e) => Grade.fromZdbk(e, major: true))
+              .map((e) => Grade.fromMajor(e))
               .toList();
           final majorGpa = GpaHelper.calculateGpa(grades);
           return Tuple(
@@ -336,8 +336,11 @@ class HznuJwxt {
       final jsonMap = decodeJsonMap(body, context: '杭师大考试响应');
       final items = jsonMap['items'] as List<dynamic>? ?? [];
 
-      final examsDto = ExamsDto.fromZdbk(items);
-      return Tuple(null, examsDto.item2);
+      final examList = items
+          .whereType<Map<String, dynamic>>()
+          .map((item) => ExamDto.fromZdbk(item))
+          .toList();
+      return Tuple(null, examList);
     } on Object catch (error, stackTrace) {
       return Tuple(
         exceptionFrom(error, context: '杭师大考试', requestUri: uri, stackTrace: stackTrace),
