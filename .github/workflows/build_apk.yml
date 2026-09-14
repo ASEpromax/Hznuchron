@@ -11,6 +11,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: 检出源码
@@ -43,8 +45,23 @@ jobs:
       - name: 构建 Release APK (arm64)
         run: flutter build apk --release --target-platform android-arm64
 
-      - name: 上传 APK 安装包
+      - name: 上传 APK 安装包到构建产物
         uses: actions/upload-artifact@v4
         with:
           name: Hznuchron-arm64-release
           path: build/app/outputs/flutter-apk/*.apk
+
+      - name: 自动同步发布到 GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.4.1
+          name: Hznuchron v1.4.1 (师大时间 Android 正式版)
+          files: build/app/outputs/flutter-apk/*.apk
+          body: |
+            ### 杭州师范大学专属《师大时间》（Hznuchron）发布版
+            - 对接杭师大统一身份认证（CAS）与正方教务管理系统
+            - 适配杭师大 45 分钟标准节次作息与仓前/下沙/玉皇山校区楼宇
+            - 预设「杭师大蓝」品牌主色调
+            
+            点击下方 Assets 展开列表中的 `.apk` 即可直接下载安装。
