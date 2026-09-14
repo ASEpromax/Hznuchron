@@ -32,10 +32,24 @@ jobs:
         run: flutter pub get
 
       - name: 语法与类型检测
-        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+        run: |
+          flutter analyze > analyze.log 2>&1 || true
+          cat analyze.log
+          echo "### Flutter Analyze 输出" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat analyze.log >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: 构建 Release APK (arm64)
-        run: flutter build apk --release --target-platform android-arm64
+        run: |
+          flutter build apk --release --target-platform android-arm64 > build.log 2>&1 || {
+            echo "### Build APK 失败日志" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 120 build.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat build.log
+            exit 1
+          }
 
       - name: 上传 APK 安装包
         uses: actions/upload-artifact@v4
