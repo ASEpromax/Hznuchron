@@ -215,7 +215,7 @@ class UgrsSpider implements Spider {
 
   @override
   void logout() {
-    unawaited(ZjuAm.clearCachedSsoCookie(_username));
+    unawaited(HznuAuth.clearCachedSsoCookie(_username));
     _username = "";
     _password = "";
     _reloginFuture = null;
@@ -248,9 +248,9 @@ class UgrsSpider implements Spider {
   Future<Cookie?> _reauthenticateSztz() async {
     final pending = _sztzReauthFuture;
     if (pending != null) return pending;
-    final future = () async {
-      await ZjuAm.clearCachedSsoCookie(_username);
-      return ZjuAm.getSsoCookie(_httpClient, _username, _password);
+    final Future<Cookie?> future = () async {
+      await HznuAuth.clearCachedSsoCookie(_username);
+      return await HznuAuth.getSsoCookie(_httpClient, _username, _password);
     }();
     _sztzReauthFuture = future;
     try {
