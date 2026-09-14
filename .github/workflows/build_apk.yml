@@ -55,8 +55,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.4.2
-          name: Hznuchron v1.4.2 (师大时间-修复统一认证AES加密版)
+          tag_name: v1.4.3
+          name: Hznuchron v1.4.3 (师大时间-支持验证码弹窗与精准报错)
           files: build/app/outputs/flutter-apk/*.apk
           body: |
             ### 杭州师范大学专属《师大时间》（Hznuchron）发布版

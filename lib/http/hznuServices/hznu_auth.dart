@@ -1,10 +1,13 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:encrypt/encrypt.dart' as enc;
 import 'package:celechron/services/diagnostic_log_service.dart';
+import 'package:celechron/design/captcha_input.dart';
+import 'package:celechron/utils/global.dart';
 import '../zjuServices/exceptions.dart';
 import '../zjuServices/response_utils.dart';
 
@@ -154,6 +157,50 @@ class HznuAuth {
     await _secureStorage.delete(key: 'hznu_sso_cookie_$username');
   }
 
+  /// 检测指定账号当前是否需要安全验证码
+  static Future<bool> _checkNeedCaptcha(
+      HttpClient httpClient, String username, Iterable<Cookie> cookies) async {
+    try {
+      final checkUri = Uri.parse(
+          '$casBaseUrl/authserver/checkNeedCaptcha.htl?username=${Uri.encodeComponent(username)}');
+      final req = await httpClient.getUrl(checkUri).timeout(
+            const Duration(seconds: 5),
+            onTimeout: () => throw requestTimeout(),
+          );
+      req.cookies.addAll(cookies);
+      final resp = await req.close().timeout(
+            const Duration(seconds: 5),
+            onTimeout: () => throw requestTimeout(),
+          );
+      final text = await readResponseBody(resp, context: '检测验证码需求');
+      final data = jsonDecode(text);
+      if (data is Map && data['isNeed'] == true) {
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  /// 获取杭师大统一认证验证码图片字节流
+  static Future<Uint8List> _fetchCaptcha(
+      HttpClient httpClient, Iterable<Cookie> cookies) async {
+    final captchaUri = Uri.parse(
+        '$casBaseUrl/authserver/getCaptcha.htl?${DateTime.now().millisecondsSinceEpoch}');
+    final req = await httpClient.getUrl(captchaUri).timeout(
+          const Duration(seconds: 8),
+          onTimeout: () => throw requestTimeout('杭师大验证码加载超时'),
+        );
+    req.cookies.addAll(cookies);
+    final resp = await req.close().timeout(
+          const Duration(seconds: 8),
+          onTimeout: () => throw requestTimeout('杭师大验证码响应超时'),
+        );
+    if (resp.statusCode != 200) {
+      throw LoginException('获取杭师大验证码失败 (HTTP ${resp.statusCode})');
+    }
+    return await consolidateHttpClientResponseBytes(resp);
+  }
+
   /// 执行认证握手
   static Future<Cookie?> _doLogin(
       HttpClient httpClient, String username, String password) async {
@@ -177,7 +224,10 @@ class HznuAuth {
           );
 
       final body1 = await readResponseBody(resp1, context: '杭师大统一认证页');
-      final cookies = List<Cookie>.from(resp1.cookies);
+      final sessionCookies = <String, Cookie>{};
+      for (final c in resp1.cookies) {
+        sessionCookies[c.name] = c;
+      }
 
       // 提取 execution 流程令牌
       final execution = RegExp(r'name="execution"\s+value="(.*?)"')
@@ -198,7 +248,7 @@ class HznuAuth {
 
       if (execution == null) {
         // 若没有表单 execution，检查是否已经属于登录状态
-        for (final cookie in cookies) {
+        for (final cookie in sessionCookies.values) {
           if (cookie.name == 'CASTGC' || cookie.name.contains('ticket')) {
             return cookie;
           }
@@ -214,7 +264,30 @@ class HznuAuth {
         encryptedPassword = password;
       }
 
-      // 4. 提交登录表单
+      // 4. 检查是否需要验证码
+      String? captchaCode;
+      final needCaptcha =
+          await _checkNeedCaptcha(httpClient, username, sessionCookies.values);
+      if (needCaptcha) {
+        if (GlobalStatus.isFirstScreenReq) {
+          throw LoginException('触发了安全验证码保护，请在手机浏览器登录一次该账号解除锁定，或在应用内重试。');
+        }
+        if (navigatorKey.currentContext == null) {
+          throw LoginException('触发了安全验证码保护，请先在手机浏览器登录一次该账号解除锁定，或稍后重试。');
+        }
+        final initialBytes =
+            await _fetchCaptcha(httpClient, sessionCookies.values);
+        captchaCode = await ImageCodePortal.show(
+          imageBytes: initialBytes,
+          onRefresh: () async =>
+              await _fetchCaptcha(httpClient, sessionCookies.values),
+        );
+        if (captchaCode == null || captchaCode.trim().isEmpty) {
+          throw LoginException('未填写验证码，登录已取消');
+        }
+      }
+
+      // 5. 提交登录表单
       final postReq = await httpClient.postUrl(loginUri).timeout(
             const Duration(seconds: 8),
             onTimeout: () => throw requestTimeout('提交杭师大认证超时'),
@@ -225,7 +298,7 @@ class HznuAuth {
       postReq.headers.add('User-Agent',
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
       postReq.headers.add('Referer', casServiceLoginUrl);
-      postReq.cookies.addAll(cookies);
+      postReq.cookies.addAll(sessionCookies.values);
 
       final postData = <String, String>{
         'username': username,
@@ -234,9 +307,10 @@ class HznuAuth {
         'cllt': 'userNameLogin',
         'dllt': 'generalLogin',
         'execution': execution,
+        'lt': lt ?? '',
       };
-      if (lt != null && lt.isNotEmpty) {
-        postData['lt'] = lt;
+      if (captchaCode != null && captchaCode.trim().isNotEmpty) {
+        postData['captcha'] = captchaCode.trim();
       }
 
       postReq.add(utf8.encode(Uri(queryParameters: postData).query));
@@ -245,7 +319,7 @@ class HznuAuth {
             onTimeout: () => throw requestTimeout('杭师大认证响应超时'),
           );
 
-      // 5. 判断认证成功
+      // 6. 判断认证成功
       // A. 服务端 302 重定向回到教务，带有 ticket=ST-...
       final redirectLocation =
           postResp.headers.value(HttpHeaders.locationHeader);
@@ -265,21 +339,27 @@ class HznuAuth {
 
       // C. 检查表单报错提示
       final failBody = await readResponseBody(postResp, context: '杭师大认证结果');
-      final errorMatch = RegExp(r'id="showErrorTip"[^>]*>(.*?)<')
-              .firstMatch(failBody)
-              ?.group(1)
-              ?.trim() ??
-          RegExp(r'class="form-error"[^>]*>(.*?)<')
-              .firstMatch(failBody)
-              ?.group(1)
-              ?.trim();
+      final errorMatch = RegExp(r'<span id="showErrorTip"[^>]*>([\s\S]*?)</span>')
+          .firstMatch(failBody)
+          ?.group(1)
+          ?.replaceAll(RegExp(r'<[^>]*>'), '')
+          .trim();
+      final fallbackMatch = RegExp(r'class="form-error"[^>]*>([\s\S]*?)</span>')
+          .firstMatch(failBody)
+          ?.group(1)
+          ?.replaceAll(RegExp(r'<[^>]*>'), '')
+          .trim();
 
-      if (errorMatch != null && errorMatch.isNotEmpty) {
-        throw LoginException('杭师大统一认证失败：$errorMatch');
+      final actualError = (errorMatch != null && errorMatch.isNotEmpty)
+          ? errorMatch
+          : (fallbackMatch != null && fallbackMatch.isNotEmpty ? fallbackMatch : null);
+
+      if (actualError != null && actualError.isNotEmpty) {
+        throw LoginException('杭师大统一认证失败：$actualError');
       }
 
-      if (failBody.contains('验证码') || failBody.contains('captcha')) {
-        throw LoginException('触发了安全验证码保护，请先在手机浏览器登录一次该账号后重试。');
+      if (failBody.contains('密码错误') || failBody.contains('用户名或密码')) {
+        throw LoginException('杭师大统一认证失败：用户名或密码错误。');
       }
 
       throw LoginException('杭师大统一身份认证失败：请核对学号或密码是否正确。');
