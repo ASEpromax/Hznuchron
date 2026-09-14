@@ -201,6 +201,15 @@ class HznuAuth {
     return await consolidateHttpClientResponseBytes(resp);
   }
 
+  /// 将表单数据严格按 application/x-www-form-urlencoded 标准进行百分号转义，
+  /// 确保 Base64 中的 '+' 字符转义为 '%2B'，防止服务端误解析为空格而破坏加密密码
+  static String _encodeFormData(Map<String, String> data) {
+    return data.entries
+        .map((e) =>
+            '${Uri.encodeQueryComponent(e.key)}=${Uri.encodeQueryComponent(e.value)}')
+        .join('&');
+  }
+
   /// 执行认证握手
   static Future<Cookie?> _doLogin(
       HttpClient httpClient, String rawUsername, String password) async {
@@ -299,6 +308,7 @@ class HznuAuth {
       postReq.headers.add('User-Agent',
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
       postReq.headers.add('Referer', casServiceLoginUrl);
+      postReq.headers.add('Origin', casBaseUrl);
       postReq.cookies.addAll(sessionCookies.values);
 
       final postData = <String, String>{
@@ -314,7 +324,7 @@ class HznuAuth {
         postData['captcha'] = captchaCode.trim();
       }
 
-      postReq.add(utf8.encode(Uri(queryParameters: postData).query));
+      postReq.add(utf8.encode(_encodeFormData(postData)));
       final postResp = await postReq.close().timeout(
             const Duration(seconds: 8),
             onTimeout: () => throw requestTimeout('杭师大认证响应超时'),
