@@ -901,3 +901,4 @@ COMMIT_MSG_*.txt
 # 诊断日志导出（含学号/成绩等个人信息，绝不入库）
 docs/elychron-test-log-*.txt
 elychron-test-log-*.txt
+*.bat

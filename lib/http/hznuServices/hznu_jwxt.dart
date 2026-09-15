@@ -91,7 +91,9 @@ class HznuJwxt {
     }
 
     // 处理 302 重定向
-    if (response.isRedirect) {
+    // 注意：Dart 的 isRedirect 不包含 302（Found），必须手动判断。
+    if ((response.statusCode == 302 || response.isRedirect) &&
+        response.headers.value(HttpHeaders.locationHeader) != null) {
       var location = response.headers.value(HttpHeaders.locationHeader);
       if (location != null) {
         final redirectUri = Uri.parse(

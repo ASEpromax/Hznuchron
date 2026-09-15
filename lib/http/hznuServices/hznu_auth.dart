@@ -222,22 +222,40 @@ class HznuAuth {
 
     try {
       // 2. 访问统一认证入口，获取 execution、lt 与动态 pwdEncryptSalt 盐值
-      final loginUri = Uri.parse(casServiceLoginUrl);
-      final req1 = await httpClient.getUrl(loginUri).timeout(
-            const Duration(seconds: 8),
-            onTimeout: () => throw requestTimeout('杭师大统一认证页面加载超时'),
-          );
-      req1.followRedirects = true;
-      final resp1 = await req1.close().timeout(
-            const Duration(seconds: 8),
-            onTimeout: () => throw requestTimeout('杭师大统一认证入口响应超时'),
-          );
+      // 手动跟随重定向以收集完整 session cookies（followRedirects=true 时
+      // Dart 只返回最终响应的 Set-Cookie，中间跳转的 cookie 会丢失）。
+      final sessionCookies = <String, Cookie>{};
+      Uri currentUri = Uri.parse(casServiceLoginUrl);
+      HttpClientResponse resp1;
+      const maxRedirects = 10;
+      var redirectCount = 0;
+      while (true) {
+        final req1 = await httpClient.getUrl(currentUri).timeout(
+              const Duration(seconds: 8),
+              onTimeout: () => throw requestTimeout('杭师大统一认证页面加载超时'),
+            );
+        req1.followRedirects = false;
+        req1.cookies.addAll(sessionCookies.values);
+        resp1 = await req1.close().timeout(
+              const Duration(seconds: 8),
+              onTimeout: () => throw requestTimeout('杭师大统一认证入口响应超时'),
+            );
+        for (final c in resp1.cookies) {
+          sessionCookies[c.name] = c;
+        }
+        final loc = resp1.headers.value(HttpHeaders.locationHeader);
+        if ((resp1.statusCode == 302 || resp1.statusCode == 301 ||
+                resp1.isRedirect) &&
+            loc != null &&
+            redirectCount < maxRedirects) {
+          redirectCount++;
+          currentUri = currentUri.resolve(loc);
+          continue;
+        }
+        break;
+      }
 
       final body1 = await readResponseBody(resp1, context: '杭师大统一认证页');
-      final sessionCookies = <String, Cookie>{};
-      for (final c in resp1.cookies) {
-        sessionCookies[c.name] = c;
-      }
 
       // 提取 execution 流程令牌
       final execution = RegExp(r'name="execution"\s+value="(.*?)"')
@@ -297,8 +315,8 @@ class HznuAuth {
         }
       }
 
-      // 5. 提交登录表单
-      final postReq = await httpClient.postUrl(loginUri).timeout(
+      // 5. 提交登录表单（POST 到表单所在页面的 URL）
+      final postReq = await httpClient.postUrl(currentUri).timeout(
             const Duration(seconds: 8),
             onTimeout: () => throw requestTimeout('提交杭师大认证超时'),
           );
@@ -332,9 +350,13 @@ class HznuAuth {
 
       // 6. 判断认证成功
       // A. 服务端 302 重定向回到教务，带有 ticket=ST-...
+      // 注意：Dart 的 isRedirect 不包含 302（Found），必须手动判断。
       final redirectLocation =
           postResp.headers.value(HttpHeaders.locationHeader);
-      if (postResp.isRedirect && redirectLocation != null) {
+      final isRedirectStatus = postResp.statusCode == 302 ||
+          postResp.statusCode == 301 ||
+          postResp.isRedirect;
+      if (isRedirectStatus && redirectLocation != null) {
         if (redirectLocation.contains('ticket') ||
             redirectLocation.contains('login_sso')) {
           return Cookie('hznu_ticket', redirectLocation);

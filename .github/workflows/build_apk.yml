@@ -55,11 +55,14 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.4.4
-          name: Hznuchron v1.4.4 (师大时间-修复表单URL编码与密码传输)
+          tag_name: v1.4.5
+          name: Hznuchron v1.4.5 (师大时间-修复统一身份认证302跳转识别与登录)
           files: build/app/outputs/flutter-apk/*.apk
           body: |
-            ### 杭州师范大学专属《师大时间》（Hznuchron）发布版
+            ### 杭州师范大学专属《师大时间》（Hznuchron）v1.4.5 发布版
+            - 修复 Dart `HttpClientResponse.isRedirect` 不包含 HTTP 302 导致统一身份认证成功后无法识别并报错的问题
+            - 修复教务 SSO 302 重定向链状态码判定
+            - 统一身份认证登录页加载增加手动重定向跟随，确保 Session Cookies 完整保留
             - 对接杭师大统一身份认证（CAS）与正方教务管理系统
             - 适配杭师大 45 分钟标准节次作息与仓前/下沙/玉皇山校区楼宇
             - 预设「杭师大蓝」品牌主色调
